@@ -1,0 +1,343 @@
+---
+title: "Cyclistic - Bước 3: Kiểm tra độ tin cậy của kết quả 7 tháng (02/2026 - 08/2026)"
+format: html
+editor: visual
+execute:
+  warning: false
+---
+
+**Có hơn 4 triệu chuyến, nên gần như mọi chênh lệch đều cho p ≈ 0, p-value không giúp phân biệt gì. Hơn nữa các chuyến không độc lập (cùng một người, cùng một ngày, cùng thời tiết). Thay vào đó file này trả lời 4 câu hỏi:**
+
+1.  Việc lọc dữ liệu có làm lệch hai nhóm không? (chunk 1)
+2.  Chênh lệch lớn cỡ nào và không chắc chắn bao nhiêu? (chunk 4, 5, 6: khoảng tin cậy bootstrap theo ngày, vì ngày là đơn vị độc lập hơn chuyến)
+3.  Kết luận có ổn định không? (chunk 2: lặp lại từng tháng, chunk 7: lặp lại ở giai đoạn khác)
+4.  Có yếu tố khác giải thích thay không? (chunk 3: tách theo loại xe và ngày cuối tuần, chunk 4: bỏ xu hướng mùa)
+
+```{r tham-so}
+out_dir   <- "C:/Users/Admin/Downloads/divvy_clean"
+ram_limit <- "4GB"
+win_start <- "2026-02-01"
+win_end   <- "2026-08-31"
+B_len     <- 1000    # số lần bootstrap cho thời lượng
+B_small   <- 2000    # số lần bootstrap cho các chỉ số còn lại
+thu_levels <- c("T2", "T3", "T4", "T5", "T6", "T7", "CN")
+col_group  <- c(casual = "#E8833A", member = "#2F6DB5")
+
+chk_dir <- file.path(out_dir, "results_7m", "kiem_dinh")
+dir.create(chk_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(out_dir, "tmp"), showWarnings = FALSE, recursive = TRUE)
+set.seed(2026)
+```
+
+```{r ket-noi}
+for (p in c("DBI", "duckdb", "dplyr", "ggplot2")) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+}
+library(DBI); library(duckdb); library(dplyr); library(ggplot2)
+
+sql_path <- function(p) gsub("'", "''", normalizePath(p, winslash = "/", mustWork = FALSE))
+q        <- function(sql) dbGetQuery(con, sql)
+show_df  <- function(x) print(as.data.frame(x), row.names = FALSE)
+save_csv <- function(x, name) write.csv(x, file.path(chk_dir, name), row.names = FALSE)
+
+if (!exists("con") || !DBI::dbIsValid(con)) {
+  con <- dbConnect(duckdb(), dbdir = file.path(out_dir, "divvy_v2.duckdb"))
+}
+dbExecute(con, sprintf("SET memory_limit='%s'", ram_limit))
+dbExecute(con, sprintf("SET temp_directory='%s'", sql_path(file.path(out_dir, "tmp"))))
+stopifnot("Thiếu trips_all hoặc trips_7m. Chạy lại Bước 1 và Bước 2 (chunk tao-bang)." =
+            dbExistsTable(con, "trips_all") && dbExistsTable(con, "trips_7m"))
+```
+
+## 1. Việc lọc dữ liệu có làm lệch hai nhóm không?
+
+```{r kiem-tra-loc}
+# 1a. Cửa sổ có đủ ngày không (bằng chứng thật, khác với bảng số ngày theo lịch)
+n_cal <- as.integer(as.Date(win_end) - as.Date(win_start)) + 1L
+chk <- q("SELECT count(DISTINCT ride_date) AS ngay_co_du_lieu, min(n) AS ngay_it_chuyen_nhat, max(n) AS ngay_nhieu_nhat
+          FROM (SELECT ride_date, count(*) AS n FROM trips_7m GROUP BY 1)")
+cat("Số ngày lịch:", n_cal, "\n"); show_df(chk)
+
+# 1b. Tỷ lệ dòng bị loại theo nhóm: hai nhóm cần gần nhau, nếu một nhóm bị loại nhiều hơn hẳn thì kết quả có thể lệch
+excl <- q(sprintf("
+  SELECT member_casual,
+         count(*) AS n_all,
+         count(*) FILTER (WHERE NOT COALESCE(is_analysis_ok, false)) AS n_loai,
+         round(100.0 * count(*) FILTER (WHERE NOT COALESCE(is_analysis_ok, false)) / count(*), 2) AS pct_loai,
+         round(100.0 * count(*) FILTER (WHERE duration_flag = 'qua_ngan') / count(*), 2) AS pct_duoi_1_phut,
+         round(100.0 * count(*) FILTER (WHERE duration_flag = 'qua_dai')  / count(*), 2) AS pct_tren_24h,
+         round(100.0 * count(*) FILTER (WHERE duration_flag = 'am')       / count(*), 3) AS pct_am,
+         round(100.0 * count(*) FILTER (WHERE dup_rank > 1)               / count(*), 3) AS pct_trung_id
+  FROM trips_all
+  WHERE ride_date BETWEEN DATE '%s' AND DATE '%s' AND member_casual IN ('member', 'casual')
+  GROUP BY member_casual ORDER BY member_casual", win_start, win_end))
+cat("\n--- Tỷ lệ dòng bị loại theo nhóm ---\n"); show_df(excl)
+save_csv(excl, "1b_ty_le_bi_loai.csv")
+
+# 1c. Đổi ngưỡng lọc thời lượng: kết luận (casual dài hơn member) có đổi không?
+cuts <- list(c(1, 1440), c(2, 1440), c(5, 1440), c(1, 360), c(1, 180))
+sens <- do.call(rbind, lapply(cuts, function(p) {
+  d <- q(sprintf("SELECT member_casual, count(*) AS n, round(median(ride_length_min), 1) AS median_phut,
+                         round(avg(ride_length_min), 1) AS mean_phut
+                  FROM trips_7m WHERE ride_length_min >= %s AND ride_length_min <= %s GROUP BY 1 ORDER BY 1", p[1], p[2]))
+  cbind(tu_phut = p[1], den_phut = p[2], d)
+}))
+cat("\n--- Đổi ngưỡng lọc thời lượng ---\n"); show_df(sens)
+save_csv(sens, "1c_doi_nguong_loc.csv")
+```
+
+## 2. Lặp lại từng tháng (7 lần kiểm chứng nhỏ)
+
+Nếu hướng kết luận đúng ở cả 7 tháng thì không phải do một tháng đặc biệt kéo lên.
+
+```{r lap-lai-theo-thang}
+by_month <- q("
+  SELECT year_month, member_casual,
+         count(*) AS n,
+         round(median(ride_length_min), 1) AS med_phut,
+         round(avg(ride_length_min), 1)    AS mean_phut,
+         round(100.0 * count(*) FILTER (WHERE rideable_type = 'electric_bike') / count(*), 1) AS pct_ebike,
+         round((count(*) FILTER (WHERE is_weekend) * 1.0 / count(DISTINCT ride_date) FILTER (WHERE is_weekend)) /
+               (count(*) FILTER (WHERE NOT is_weekend) * 1.0 / count(DISTINCT ride_date) FILTER (WHERE NOT is_weekend)), 2) AS weekend_index
+  FROM trips_7m GROUP BY year_month, member_casual ORDER BY year_month, member_casual")
+
+w <- reshape(by_month, idvar = "year_month", timevar = "member_casual", direction = "wide")
+w$casual_pct_tong_chuyen <- round(w$n.casual / (w$n.casual + w$n.member) * 100, 1)
+w$casual_trung_vi_dai_hon   <- w$med_phut.casual  > w$med_phut.member
+w$casual_trung_binh_dai_hon <- w$mean_phut.casual > w$mean_phut.member
+w$casual_cuoituan_manh_hon  <- w$weekend_index.casual > w$weekend_index.member
+w$casual_ebike_nhieu_hon    <- w$pct_ebike.casual > w$pct_ebike.member
+
+cat("weekend_index = (chuyến TB mỗi ngày cuối tuần) / (chuyến TB mỗi ngày thường). >1: cuối tuần đông hơn.\n\n")
+show_df(w[, c("year_month", "casual_pct_tong_chuyen", "med_phut.casual", "med_phut.member",
+              "mean_phut.casual", "mean_phut.member", "weekend_index.casual", "weekend_index.member",
+              "pct_ebike.casual", "pct_ebike.member")])
+flags <- c("casual_trung_vi_dai_hon", "casual_trung_binh_dai_hon", "casual_cuoituan_manh_hon", "casual_ebike_nhieu_hon")
+cat("\n--- Số tháng (trên 7) mà hướng kết luận giữ nguyên ---\n")
+print(sapply(w[flags], function(x) sprintf("%d / %d tháng", sum(x), length(x))))
+save_csv(w, "2_lap_lai_theo_thang.csv")
+```
+
+## 3. Tách theo loại xe và ngày cuối tuần
+
+Câu hỏi: khoảng cách thời lượng giữa casual và member nằm ở xe classic hay xe điện? Việc casual đi lâu hơn vào cuối tuần là do đổi loại xe hay do chính cách đi?
+
+```{r phan-tang}
+strat <- q("
+  SELECT rideable_type, member_casual,
+         CASE WHEN is_weekend THEN 'Cuối tuần' ELSE 'Ngày thường' END AS loai_ngay,
+         count(*) AS n,
+         round(median(ride_length_min), 1) AS median_phut,
+         round(avg(ride_length_min), 1)    AS mean_phut,
+         round(quantile_cont(ride_length_min, 0.9), 1) AS p90_phut
+  FROM trips_7m GROUP BY 1, 2, 3 ORDER BY 1, 2, 3")
+cat("--- Thời lượng theo loại xe x nhóm x loại ngày ---\n"); show_df(strat)
+save_csv(strat, "3a_phan_tang_thoi_luong.csv")
+
+mix <- q("
+  SELECT member_casual,
+         CASE WHEN is_weekend THEN 'Cuối tuần' ELSE 'Ngày thường' END AS loai_ngay,
+         round(100.0 * count(*) FILTER (WHERE rideable_type = 'electric_bike') / count(*), 1) AS pct_xe_dien
+  FROM trips_7m GROUP BY 1, 2 ORDER BY 1, 2")
+cat("\n--- Tỷ lệ xe điện theo nhóm x loại ngày (có đổi loại xe vào cuối tuần không?) ---\n"); show_df(mix)
+save_csv(mix, "3b_ty_le_xe_dien_theo_loai_ngay.csv")
+```
+
+## 4. Chỉ số thứ trong tuần đã bỏ xu hướng mùa, có khoảng tin cậy
+
+Số chuyến mỗi ngày tăng mạnh từ tháng 2 đến tháng 8 (xu hướng mùa). Để tách xu hướng này ra, mỗi ngày được chia cho **trung bình 7 ngày quanh nó**. Chỉ số = 1 nghĩa là ngày đó bằng ngày trung bình của tuần. Khoảng tin cậy lấy từ bootstrap trên khoảng 30 ngày của mỗi thứ.
+
+```{r chi-so-thu}
+daily <- q("
+  SELECT ride_date, member_casual, count(*) AS n,
+         count(*) FILTER (WHERE rideable_type = 'electric_bike') AS n_ebike
+  FROM trips_7m GROUP BY ride_date, member_casual ORDER BY ride_date")
+daily$ride_date   <- as.Date(daily$ride_date)
+daily$day_of_week <- as.integer(format(daily$ride_date, "%w")) + 1L   # 1 = CN ... 7 = T7
+
+wd_index <- function(d) {
+  d <- d[order(d$ride_date), ]
+  ma <- as.numeric(stats::filter(d$n, rep(1 / 7, 7), sides = 2))     # trung bình 7 ngày, căn giữa
+  d$idx <- d$n / ma
+  d[!is.na(d$idx), ]
+}
+boot_ci <- function(x, B = B_small) quantile(replicate(B, mean(sample(x, length(x), TRUE))), c(0.025, 0.975))
+
+idx_all <- do.call(rbind, lapply(split(daily, daily$member_casual), function(d) {
+  r <- wd_index(d); r$member_casual <- d$member_casual[1]; r }))
+wd <- do.call(rbind, lapply(split(idx_all, list(idx_all$member_casual, idx_all$day_of_week), drop = TRUE), function(d) {
+  ci <- boot_ci(d$idx)
+  data.frame(member_casual = d$member_casual[1], day_of_week = d$day_of_week[1],
+             so_ngay = nrow(d), chi_so = round(mean(d$idx), 2), lo = round(ci[[1]], 2), hi = round(ci[[2]], 2))
+}))
+wd$thu <- c("CN", "T2", "T3", "T4", "T5", "T6", "T7")[wd$day_of_week]
+wd <- wd[order(wd$member_casual, match(wd$thu, thu_levels)), ]
+cat("--- Chỉ số thứ (1.00 = ngày trung bình trong tuần), kèm khoảng tin cậy 95% ---\n")
+show_df(wd[, c("member_casual", "thu", "so_ngay", "chi_so", "lo", "hi")])
+save_csv(wd, "4_chi_so_thu_co_khoang_tin_cay.csv")
+```
+
+```{r bieu-do-chi-so-thu}
+#| fig-width: 8
+#| fig-height: 4
+p4 <- ggplot(wd, aes(factor(thu, thu_levels), chi_so, color = member_casual, group = member_casual)) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "grey60") +
+  geom_line(position = position_dodge(width = 0.3)) +
+  geom_pointrange(aes(ymin = lo, ymax = hi), position = position_dodge(width = 0.3)) +
+  scale_color_manual(values = col_group, name = NULL) +
+  labs(title = "Chỉ số thứ trong tuần (đã bỏ xu hướng mùa), khoảng tin cậy 95%",
+       x = NULL, y = "1.00 = ngày trung bình của tuần") +
+  theme_minimal()
+print(p4)
+ggsave(file.path(chk_dir, "4_chi_so_thu.png"), p4, width = 8, height = 4, dpi = 150)
+```
+
+## 5. Khoảng tin cậy cho chênh lệch thời lượng (bootstrap theo ngày)
+
+Mỗi lần bootstrap rút lại 212 ngày có hoàn lại, tính lại các chỉ số cho cả hai nhóm trên **cùng các ngày đó**. Thời lượng được tính theo phút nguyên, vì dữ liệu chỉ ghi đến phút.
+
+-   `med_diff`, `mean_diff`: casual trừ member (phút)
+-   `mean_ratio`: trung bình casual / member (\>1 nghĩa là casual dài hơn)
+-   `ge30_diff`: chênh lệch tỷ lệ chuyến từ 30 phút trở lên (điểm %)
+-   `p_sup`: xác suất một chuyến casual ngẫu nhiên dài hơn một chuyến member ngẫu nhiên (0.5 = không khác biệt)
+
+```{r bootstrap-thoi-luong}
+mins <- 0:1440
+h_stats <- function(h) {
+  tot <- sum(h)
+  c(mean = sum(mins * h) / tot, med = mins[which(cumsum(h) >= tot / 2)[1]], ge30 = sum(h[mins >= 30]) / tot * 100)
+}
+p_sup <- function(hc, hm) {
+  pc <- hc / sum(hc); pm <- hm / sum(hm)
+  less <- c(0, cumsum(pm)[-length(pm)])
+  sum(pc * (less + 0.5 * pm))
+}
+hist_sql <- function(where = "") {
+  q(paste0("SELECT ride_date, member_casual, (ride_length_sec // 60)::INT AS m, count(*) AS n
+            FROM trips_7m WHERE TRUE ", where, " GROUP BY 1, 2, 3"))
+}
+make_mats <- function(h) {
+  days <- sort(unique(as.Date(h$ride_date)))
+  h$di <- match(as.Date(h$ride_date), days)
+  h$mi <- h$m + 1L
+  mk <- function(g) {
+    x <- h[h$member_casual == g, ]
+    M <- matrix(0, length(days), length(mins))
+    M[cbind(x$di, x$mi)] <- x$n
+    M
+  }
+  list(casual = mk("casual"), member = mk("member"))
+}
+boot_len <- function(label, where = "", B = B_len) {
+  mats <- make_mats(hist_sql(where)); nd <- nrow(mats$casual)
+  est <- function(idx) {
+    hc <- colSums(mats$casual[idx, , drop = FALSE]); hm <- colSums(mats$member[idx, , drop = FALSE])
+    sc <- h_stats(hc); sm <- h_stats(hm)
+    c(med_diff = unname(sc["med"] - sm["med"]), mean_diff = unname(sc["mean"] - sm["mean"]),
+      mean_ratio = unname(sc["mean"] / sm["mean"]), ge30_diff = unname(sc["ge30"] - sm["ge30"]),
+      p_sup = p_sup(hc, hm))
+  }
+  pt <- est(seq_len(nd))
+  bs <- t(replicate(B, est(sample.int(nd, nd, TRUE))))
+  data.frame(nhom_xe = label, chi_so = names(pt), uoc_luong = round(unname(pt), 3),
+             lo = round(apply(bs, 2, quantile, probs = 0.025), 3),
+             hi = round(apply(bs, 2, quantile, probs = 0.975), 3), row.names = NULL)
+}
+
+res_len <- rbind(
+  boot_len("Tất cả xe"),
+  boot_len("Chỉ classic_bike",  "AND rideable_type = 'classic_bike'"),
+  boot_len("Chỉ electric_bike", "AND rideable_type = 'electric_bike'")
+)
+cat("--- Chênh lệch thời lượng casual so với member, khoảng tin cậy 95% ---\n"); show_df(res_len)
+save_csv(res_len, "5_bootstrap_thoi_luong.csv")
+```
+
+## 6. Khoảng tin cậy cho tỷ lệ xe điện và mức tăng cuối tuần, cùng độ lớn hiệu ứng
+
+```{r bootstrap-ty-le}
+dw <- reshape(daily[, c("ride_date", "member_casual", "n", "n_ebike")],
+              idvar = "ride_date", timevar = "member_casual", direction = "wide")
+dw <- dw[order(dw$ride_date), ]
+dw$wkend <- as.integer(format(dw$ride_date, "%w")) %in% c(0L, 6L)
+stopifnot("Có ngày thiếu dữ liệu của một nhóm" = !anyNA(dw[, c("n.casual", "n.member")]))
+
+calc <- function(d_e, d_w) {
+  e  <- sum(d_e$n_ebike.casual) / sum(d_e$n.casual) * 100 - sum(d_e$n_ebike.member) / sum(d_e$n.member) * 100
+  wc <- mean(d_w$n.casual[d_w$wkend]) / mean(d_w$n.casual[!d_w$wkend])
+  wm <- mean(d_w$n.member[d_w$wkend]) / mean(d_w$n.member[!d_w$wkend])
+  c(ebike_diff_diem_pct = e, weekend_index_casual = wc, weekend_index_member = wm, weekend_index_chenh = wc - wm)
+}
+iw <- which(dw$wkend); ik <- which(!dw$wkend); nd <- nrow(dw)
+pt <- calc(dw, dw)
+bs <- t(replicate(B_small, {
+  d_e <- dw[sample.int(nd, nd, TRUE), ]                                        # bootstrap toàn bộ ngày
+  d_w <- dw[c(iw[sample.int(length(iw), length(iw), TRUE)],
+              ik[sample.int(length(ik), length(ik), TRUE)]), ]                 # bootstrap phân tầng: cuối tuần / ngày thường
+  calc(d_e, d_w)
+}))
+res_prop <- data.frame(chi_so = names(pt), uoc_luong = round(unname(pt), 3),
+                       lo = round(apply(bs, 2, quantile, probs = 0.025), 3),
+                       hi = round(apply(bs, 2, quantile, probs = 0.975), 3), row.names = NULL)
+cat("--- Khoảng tin cậy 95% (casual trừ member) ---\n"); show_df(res_prop)
+save_csv(res_prop, "6a_bootstrap_ty_le.csv")
+
+# Độ lớn hiệu ứng: Cramér's V (0.1 nhỏ, 0.3 vừa, 0.5 lớn). Không báo p-value vì n quá lớn.
+cramers_v <- function(tab) {
+  ch <- suppressWarnings(chisq.test(tab, correct = FALSE))
+  unname(sqrt(ch$statistic / (sum(tab) * (min(dim(tab)) - 1))))
+}
+tb_bike <- q("SELECT rideable_type, member_casual, count(*) AS n FROM trips_7m GROUP BY 1, 2")
+tb_dow  <- q("SELECT day_of_week, member_casual, count(*) AS n FROM trips_7m GROUP BY 1, 2")
+v_tab <- data.frame(so_sanh = c("Loại xe x nhóm khách", "Thứ trong tuần x nhóm khách"),
+                    cramers_v = round(c(cramers_v(xtabs(n ~ rideable_type + member_casual, tb_bike)),
+                                        cramers_v(xtabs(n ~ day_of_week + member_casual, tb_dow))), 3))
+cat("\n--- Độ lớn hiệu ứng (Cramér's V) ---\n"); show_df(v_tab)
+save_csv(v_tab, "6b_cramers_v.csv")
+```
+
+## 7. Kiểm chứng ở giai đoạn khác
+
+Cùng các chỉ số chính, tính lại ở: - **05-08/2026** và **05-08/2025**: cùng mùa, khác năm (so sánh sạch nhất) - **08/2021-07/2022**: cả một năm đủ dữ liệu, khác thời kỳ
+
+Nếu hướng kết luận giống nhau ở mọi giai đoạn, bạn có thể tin kết quả hơn.
+
+```{r kiem-chung-giai-doan}
+wins <- list(
+  "Chính: 02/2026-08/2026"      = c("2026-02-01", "2026-08-31"),
+  "Cùng mùa: 05/2026-08/2026"   = c("2026-05-01", "2026-08-31"),
+  "Cùng mùa năm trước: 05/2025-08/2025" = c("2025-05-01", "2025-08-31"),
+  "Cả năm: 08/2021-07/2022"     = c("2021-08-01", "2022-07-31")
+)
+key_metrics <- function(s, e) {
+  q(sprintf("
+    WITH t AS (SELECT * FROM trips_all WHERE is_analysis_ok AND ride_date BETWEEN DATE '%s' AND DATE '%s')
+    SELECT member_casual,
+           count(*) AS n,
+           round(median(ride_length_min), 1) AS median_phut,
+           round(avg(ride_length_min), 1)    AS mean_phut,
+           round(100.0 * count(*) FILTER (WHERE rideable_type = 'electric_bike') / count(*), 1) AS pct_xe_dien,
+           round((count(*) FILTER (WHERE is_weekend) * 1.0 / count(DISTINCT ride_date) FILTER (WHERE is_weekend)) /
+                 (count(*) FILTER (WHERE NOT is_weekend) * 1.0 / count(DISTINCT ride_date) FILTER (WHERE NOT is_weekend)), 2) AS weekend_index
+    FROM t GROUP BY member_casual ORDER BY member_casual", s, e))
+}
+sat_share <- function(s, e) {
+  q(sprintf("
+    SELECT round(100.0 * count(*) FILTER (WHERE member_casual = 'casual' AND day_of_week = 7) /
+                 count(*) FILTER (WHERE day_of_week = 7), 1) AS casual_pct_tong_chuyen_thu_7,
+           round(100.0 * count(*) FILTER (WHERE member_casual = 'casual' AND day_of_week IN (3, 4, 5)) /
+                 count(*) FILTER (WHERE day_of_week IN (3, 4, 5)), 1) AS casual_pct_tong_chuyen_T3_T5
+    FROM trips_all WHERE is_analysis_ok AND member_casual IN ('member', 'casual')
+      AND ride_date BETWEEN DATE '%s' AND DATE '%s'", s, e))
+}
+rep_main <- do.call(rbind, lapply(names(wins), function(nm) cbind(giai_doan = nm, key_metrics(wins[[nm]][1], wins[[nm]][2]))))
+rep_sat  <- do.call(rbind, lapply(names(wins), function(nm) cbind(giai_doan = nm, sat_share(wins[[nm]][1], wins[[nm]][2]))))
+cat("--- Chỉ số chính theo giai đoạn ---\n"); show_df(rep_main)
+cat("\n--- Casual chiếm bao nhiêu % tổng chuyến vào thứ 7 và giữa tuần ---\n"); show_df(rep_sat)
+save_csv(rep_main, "7a_kiem_chung_giai_doan.csv"); save_csv(rep_sat, "7b_casual_share_thu_7.csv")
+```
+
+```{r dong-ket-noi}
+dbDisconnect(con, shutdown = TRUE)
+cat("Hoàn tất. Kết quả nằm ở:", chk_dir, "\n")
+```

@@ -1,0 +1,202 @@
+---
+title: "gggggg"
+format: html
+editor: visual
+---
+
+```{r}
+dbExecute(con, sprintf("
+  CREATE OR REPLACE TABLE trips_7m AS
+  SELECT ride_id, rideable_type, member_casual, started_ts, ended_ts,
+         ride_date, ride_year, ride_month, year_month,
+         day_of_week, day_name, is_weekend, start_hour,
+         ride_length_sec, ride_length_min
+  FROM trips_all
+  WHERE is_analysis_ok AND ride_date BETWEEN DATE '%s' AND DATE '%s'", win_start, win_end))
+
+n_all <- q(sprintf("SELECT count(*) AS n FROM trips_all WHERE ride_date BETWEEN DATE '%s' AND DATE '%s'", win_start, win_end))$n
+n_7m  <- q("SELECT count(*) AS n FROM trips_7m")$n
+cat("Số dòng trong cửa sổ:", format(n_all, big.mark = ","),
+    "| dùng được:", format(n_7m, big.mark = ","),
+    sprintf("| bị loại: %s (%.2f%%)\n", format(n_all - n_7m, big.mark = ","), (n_all - n_7m) / n_all * 100))
+
+# Kiểm tra: mọi ngày trong cửa sổ đều có dữ liệu, không có ngày thấp bất thường
+n_cal  <- as.integer(as.Date(win_end) - as.Date(win_start)) + 1L
+n_days <- q("SELECT count(DISTINCT ride_date) AS n FROM trips_7m")$n
+cat("Số ngày lịch:", n_cal, "| số ngày có dữ liệu:", n_days, "\n")
+cat("\n5 ngày có ít chuyến nhất (xem có ngày nào bất thường không):\n")
+show_df(q("SELECT ride_date, count(*) AS n_rides FROM trips_7m GROUP BY ride_date ORDER BY n_rides LIMIT 5"))
+
+cat("\nSố lần xuất hiện của mỗi thứ trong cửa sổ (phải gần bằng nhau):\n")
+show_df(q(sprintf("
+  SELECT (dayofweek(d) + 1)::INT AS day_of_week, count(*) AS n_days
+  FROM generate_series(DATE '%s', DATE '%s', INTERVAL 1 DAY) AS t(d)
+  GROUP BY 1 ORDER BY 1", win_start, win_end)))
+```
+
+```{r}
+cau1 <- q("
+  SELECT member_casual,
+         count(*)                                   AS so_chuyen,
+         round(avg(ride_length_min), 1)             AS mean_phut,
+         round(median(ride_length_min), 1)          AS median_phut,
+         round(quantile_cont(ride_length_min, 0.25), 1) AS q1_phut,
+         round(quantile_cont(ride_length_min, 0.75), 1) AS q3_phut,
+         round(quantile_cont(ride_length_min, 0.90), 1) AS p90_phut,
+         round(avg(ride_length_min) / median(ride_length_min), 2) AS mean_chia_median
+  FROM trips_7m GROUP BY member_casual ORDER BY member_casual")
+cat("--- Câu 1a: thống kê thời lượng chuyến (phút) ---\n"); show_df(cau1)
+save_csv(cau1, "cau1a_thong_ke_thoi_luong.csv")
+
+med <- setNames(cau1$median_phut, cau1$member_casual)
+cat(sprintf("\nTrung vị casual / member = %.2f lần\n", med["casual"] / med["member"]))
+
+cau1_nhom <- q("
+  WITH b AS (
+    SELECT member_casual,
+           CASE WHEN ride_length_min < 5  THEN '1. dưới 5 phút'
+                WHEN ride_length_min < 10 THEN '2. 5-10 phút'
+                WHEN ride_length_min < 20 THEN '3. 10-20 phút'
+                WHEN ride_length_min < 30 THEN '4. 20-30 phút'
+                WHEN ride_length_min < 60 THEN '5. 30-60 phút'
+                ELSE '6. từ 60 phút trở lên' END AS nhom
+    FROM trips_7m)
+  SELECT member_casual, nhom, count(*) AS so_chuyen,
+         round(count(*) * 100.0 / sum(count(*)) OVER (PARTITION BY member_casual), 1) AS pct_trong_nhom
+  FROM b GROUP BY member_casual, nhom ORDER BY member_casual, nhom")
+cat("\n--- Câu 1b: phân bố thời lượng theo khoảng ---\n"); show_df(cau1_nhom)
+save_csv(cau1_nhom, "cau1b_phan_bo_thoi_luong.csv")
+
+cau1_thu <- q("
+  SELECT day_of_week,
+         CASE day_of_week WHEN 1 THEN 'CN' WHEN 2 THEN 'T2' WHEN 3 THEN 'T3' WHEN 4 THEN 'T4'
+                          WHEN 5 THEN 'T5' WHEN 6 THEN 'T6' ELSE 'T7' END AS thu,
+         member_casual,
+         round(median(ride_length_min), 1) AS median_phut,
+         round(avg(ride_length_min), 1)    AS mean_phut
+  FROM trips_7m GROUP BY day_of_week, member_casual ORDER BY member_casual, day_of_week")
+cat("\n--- Câu 1c: thời lượng theo thứ trong tuần ---\n"); show_df(cau1_thu)
+save_csv(cau1_thu, "cau1c_thoi_luong_theo_thu.csv")
+```
+
+```{r}
+cau2 <- q(sprintf("
+  WITH cal AS (
+    SELECT (dayofweek(d) + 1)::INT AS day_of_week, count(*) AS n_days
+    FROM generate_series(DATE '%s', DATE '%s', INTERVAL 1 DAY) AS t(d)
+    GROUP BY 1),
+  r AS (
+    SELECT day_of_week, member_casual, count(*) AS so_chuyen
+    FROM trips_7m GROUP BY 1, 2)
+  SELECT r.day_of_week,
+         CASE r.day_of_week WHEN 1 THEN 'CN' WHEN 2 THEN 'T2' WHEN 3 THEN 'T3' WHEN 4 THEN 'T4'
+                            WHEN 5 THEN 'T5' WHEN 6 THEN 'T6' ELSE 'T7' END AS thu,
+         r.member_casual, r.so_chuyen, c.n_days,
+         round(r.so_chuyen * 1.0 / c.n_days)                                          AS chuyen_tb_moi_ngay,
+         round(r.so_chuyen * 100.0 / sum(r.so_chuyen) OVER (PARTITION BY r.member_casual), 1) AS pct_trong_nhom
+  FROM r JOIN cal c USING (day_of_week)
+  ORDER BY r.member_casual, r.day_of_week", win_start, win_end))
+cat("--- Câu 2a: theo thứ trong tuần ---\n"); show_df(cau2)
+save_csv(cau2, "cau2a_theo_thu.csv")
+```
+
+```{r}
+# Tỷ trọng casual trong tổng số chuyến mỗi thứ
+wide <- reshape(cau2[, c("thu", "member_casual", "chuyen_tb_moi_ngay")],
+                idvar = "thu", timevar = "member_casual", direction = "wide")
+names(wide) <- sub("chuyen_tb_moi_ngay.", "", names(wide), fixed = TRUE)
+wide$casual_pct_tong <- round(wide$casual / (wide$casual + wide$member) * 100, 1)
+wide <- wide[match(thu_levels, wide$thu), ]
+cat("--- Câu 2b: casual chiếm bao nhiêu % tổng chuyến mỗi thứ ---\n"); show_df(wide)
+save_csv(wide, "cau2b_casual_share_theo_thu.csv")
+```
+
+```{r}
+cau2_wk <- q("
+  SELECT member_casual,
+         CASE WHEN is_weekend THEN 'Cuối tuần (T7, CN)' ELSE 'Ngày thường (T2-T6)' END AS loai_ngay,
+         count(*)                         AS so_chuyen,
+         count(DISTINCT ride_date)        AS so_ngay,
+         round(count(*) * 1.0 / count(DISTINCT ride_date)) AS chuyen_tb_moi_ngay,
+         round(count(*) * 100.0 / sum(count(*)) OVER (PARTITION BY member_casual), 1) AS pct_trong_nhom
+  FROM trips_7m GROUP BY 1, 2 ORDER BY 1, 2")
+cat("--- Câu 2c: ngày thường vs cuối tuần ---\n"); show_df(cau2_wk)
+save_csv(cau2_wk, "cau2c_ngay_thuong_vs_cuoi_tuan.csv")
+
+# Chỉ số cuối tuần = (chuyến TB/ngày cuối tuần) / (chuyến TB/ngày ngày thường). >1: cuối tuần đông hơn
+idx <- sapply(split(cau2_wk, cau2_wk$member_casual), function(d) {
+  d$chuyen_tb_moi_ngay[grepl("Cuối tuần", d$loai_ngay)] / d$chuyen_tb_moi_ngay[grepl("Ngày thường", d$loai_ngay)]
+})
+cat("\nChỉ số cuối tuần / ngày thường (chuyến TB mỗi ngày):\n"); print(round(idx, 2))
+```
+
+```{r}
+cat("Các loại xe có trong cửa sổ:\n")
+show_df(q("SELECT rideable_type, count(*) AS n FROM trips_7m GROUP BY 1 ORDER BY n DESC"))
+
+cau3 <- q("
+  SELECT member_casual, rideable_type, count(*) AS so_chuyen,
+         round(count(*) * 100.0 / sum(count(*)) OVER (PARTITION BY member_casual), 1) AS pct_trong_nhom,
+         round(median(ride_length_min), 1) AS median_phut
+  FROM trips_7m GROUP BY member_casual, rideable_type ORDER BY member_casual, so_chuyen DESC")
+cat("\n--- Câu 3a: tỷ trọng loại xe trong từng nhóm + thời lượng trung vị ---\n"); show_df(cau3)
+save_csv(cau3, "cau3a_loai_xe.csv")
+
+cau3_share <- q("
+  SELECT rideable_type, member_casual, count(*) AS so_chuyen,
+         round(count(*) * 100.0 / sum(count(*)) OVER (PARTITION BY rideable_type), 1) AS pct_trong_loai_xe
+  FROM trips_7m GROUP BY rideable_type, member_casual ORDER BY rideable_type, member_casual")
+cat("\n--- Câu 3b: trong mỗi loại xe, casual và member chiếm bao nhiêu % ---\n"); show_df(cau3_share)
+save_csv(cau3_share, "cau3b_ty_trong_theo_loai_xe.csv")
+```
+
+```{r}
+#| fig-width: 8
+#| fig-height: 4
+d1 <- q("
+  SELECT member_casual, floor(ride_length_min)::INT AS phut, count(*) AS n
+  FROM trips_7m WHERE ride_length_min < 60 GROUP BY 1, 2")
+d1 <- d1 %>% group_by(member_casual) %>% mutate(pct = n / sum(n) * 100) %>% ungroup()
+
+p1 <- ggplot(d1, aes(phut, pct, color = member_casual)) +
+  geom_line(linewidth = 1) +
+  geom_vline(data = cau1, aes(xintercept = median_phut, color = member_casual), linetype = "dashed", show.legend = FALSE) +
+  scale_color_manual(values = col_group, name = NULL) +
+  labs(title = "Phân bố thời lượng chuyến đi (chuyến dưới 60 phút)",
+       subtitle = "Đường đứt = trung vị của mỗi nhóm", x = "Số phút", y = "% chuyến trong nhóm") +
+  theme_minimal()
+print(p1); ggsave(file.path(fig_dir, "cau1_phan_bo_thoi_luong.png"), p1, width = 8, height = 4, dpi = 150)
+```
+
+```{r}
+#| fig-width: 9
+#| fig-height: 4
+d2 <- cau2 %>% mutate(thu = factor(thu, levels = thu_levels))
+
+p2a <- ggplot(d2, aes(thu, chuyen_tb_moi_ngay, fill = member_casual)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = col_group, name = NULL) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Số chuyến trung bình mỗi ngày, theo thứ trong tuần", x = NULL, y = "Chuyến / ngày") +
+  theme_minimal()
+p2b <- ggplot(d2, aes(thu, pct_trong_nhom, color = member_casual, group = member_casual)) +
+  geom_line(linewidth = 1) + geom_point(size = 2) +
+  scale_color_manual(values = col_group, name = NULL) +
+  labs(title = "Tỷ trọng chuyến theo thứ, trong từng nhóm", x = NULL, y = "% chuyến của nhóm") +
+  theme_minimal()
+print(p2a); print(p2b)
+ggsave(file.path(fig_dir, "cau2a_chuyen_tb_moi_ngay.png"), p2a, width = 9, height = 4, dpi = 150)
+ggsave(file.path(fig_dir, "cau2b_ty_trong_theo_thu.png"),  p2b, width = 9, height = 4, dpi = 150)
+```
+
+```{r}
+#| fig-width: 7
+#| fig-height: 3.5
+p3 <- ggplot(cau3, aes(member_casual, pct_trong_nhom, fill = rideable_type)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = paste0(pct_trong_nhom, "%")), position = position_stack(vjust = 0.5), size = 3.5) +
+  coord_flip() +
+  labs(title = "Cơ cấu loại xe theo nhóm khách hàng", x = NULL, y = "% chuyến trong nhóm", fill = NULL) +
+  theme_minimal()
+print(p3); ggsave(file.path(fig_dir, "cau3_loai_xe.png"), p3, width = 7, height = 3.5, dpi = 150)
+```
