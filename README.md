@@ -19,3 +19,5 @@ Design weekend-specific incentives for casual riders and validate them with a ra
 - `b.Analyze.qmd`: main analysis
 - `c.Double Check.qmd`: robustness checks
 - `Report Final.pdf`: full report
+## Full write-up
+Read the full project walkthrough on Notion: https://large-gauge-ed0.notion.site/Cyclistic-Bike-Share-Member-vs-Casual-Rider-Analysis-3f670e6c6a96805484eae04a4b49c5dc  
